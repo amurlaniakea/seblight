@@ -14,3 +14,4 @@ venv/
 .coverage
 htmlcov/
 .DS_Store
+AGENTS.md
