@@ -80,9 +80,11 @@ class PolicyEngine:
         "mv ", "cp -r ",
         "chmod ", "chown ",
         "apt remove", "apt purge", "pip uninstall",
-        "docker stop", "docker kill",
+        "docker stop", "docker kill", "docker rm",
+        "docker build", "docker pull",
         "systemctl restart", "service restart",
         "curl ", "wget ", "nc ", "ncat ",
+        "ssh ", "scp ", "rsync ",
     ]
 
     def __init__(

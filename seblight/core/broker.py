@@ -23,9 +23,13 @@ from .models import (
     LedgerEntry,
     PolicyDecision,
     Proposal,
+    ProposalType,
     Severity,
 )
 from .policy import PolicyEngine
+
+# Import adapters
+from ..adapters import DockerAdapter, FileAdapter, SSHAdapter
 
 
 @dataclass
@@ -77,6 +81,11 @@ class SovereignExecutionBroker:
             max_output_bytes=self.config.max_output_bytes,
         )
         self.ledger = Ledger(log_file=self.config.ledger_file)
+
+        # Initialize adapters
+        self.file_adapter = FileAdapter()
+        self.docker_adapter = DockerAdapter()
+        self.ssh_adapter = SSHAdapter()
 
         # Track active certificates
         self._active_certificates: dict[str, Certificate] = {}
@@ -160,22 +169,18 @@ class SovereignExecutionBroker:
             )
             return result
 
-        # Step 5: Execute
+        # Step 5: Execute via appropriate adapter
         if self.config.dry_run:
             result["steps"].append("5. DRY RUN — Execution skipped")
             exec_result = ExecutionResult(
                 success=True,
                 certificate_id=cert.id,
                 proposal_id=proposal.id,
-                output="[DRY RUN] Command would be executed here",
+                output="[DRY RUN] Action would be executed here",
             )
         else:
-            exec_result = self.executor.execute(
-                proposal=proposal,
-                certificate_id=cert.id,
-                dry_run=False,
-            )
-            result["steps"].append(f"5. Executed — exit code: {exec_result.exit_code}")
+            exec_result = self._execute_via_adapter(proposal, cert.id)
+            result["steps"].append(f"5. Executed via {proposal.proposal_type.value} adapter — exit code: {exec_result.exit_code}")
 
         # Step 6: Log execution result
         self.ledger.append(
@@ -226,3 +231,15 @@ class SovereignExecutionBroker:
             "ledger_integrity": valid,
             "first_broken_entry": broken,
         }
+
+    def _execute_via_adapter(self, proposal: Proposal, certificate_id: str) -> ExecutionResult:
+        """Route execution to the appropriate adapter based on proposal type."""
+        match proposal.proposal_type:
+            case ProposalType.FILE_WRITE | ProposalType.FILE_DELETE | ProposalType.FILE_CHMOD | ProposalType.FILE_READ:
+                return self.file_adapter.execute(proposal, certificate_id)
+            case ProposalType.DOCKER:
+                return self.docker_adapter.execute(proposal, certificate_id)
+            case ProposalType.SSH:
+                return self.ssh_adapter.execute(proposal, certificate_id)
+            case ProposalType.COMMAND | _:
+                return self.executor.execute(proposal, certificate_id)

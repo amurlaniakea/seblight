@@ -22,6 +22,10 @@ class ProposalType(str, Enum):
     COMMAND = "command"           # Shell command
     FILE_WRITE = "file_write"     # Write to file
     FILE_DELETE = "file_delete"   # Delete file
+    FILE_CHMOD = "file_chmod"     # Change file permissions
+    FILE_READ = "file_read"       # Read file
+    DOCKER = "docker"             # Docker operations
+    SSH = "ssh"                   # SSH remote execution
     NETWORK = "network"           # Network operation
     PROCESS = "process"           # Process management
     CUSTOM = "custom"             # Custom operation
