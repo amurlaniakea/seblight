@@ -151,7 +151,7 @@ python3 /home/sil/seblight/seblight_run.py execute "action" "command"
 
 ## License
 
-MIT
+AGPL-3.0 — Copyright (C) 2026 Pedro Sordo Martínez <amurlaniakea@gmail.com>
 
 ## References
 

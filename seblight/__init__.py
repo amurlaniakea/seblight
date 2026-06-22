@@ -1,4 +1,8 @@
-"""SEB-Light: Sovereign Execution Broker (Python implementation)"""
+"""SEB-Light: Sovereign Execution Broker (Python implementation)
+
+Copyright (C) 2026 Pedro Sordo Martínez <amurlaniakea@gmail.com>
+License: AGPL-3.0
+"""
 
 from .core.broker import BrokerConfig, SovereignExecutionBroker
 from .core.models import (
