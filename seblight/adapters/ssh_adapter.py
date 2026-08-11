@@ -39,15 +39,20 @@ class SSHAdapter:
             if not host or not command:
                 return self._error(certificate_id, proposal.id, started_at, "Host and command required")
 
-            # Build SSH command
-            ssh_cmd = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p {port}"
-            if key_file:
-                ssh_cmd += f" -i {key_file}"
-            ssh_cmd += f" {user}@{host} '{command}'"
+            # Build SSH command as an argument LIST (never a shell string).
+            # The host/user/key_file/command are isolated argv elements, so a
+            # host like 'x; rm -rf ~' cannot inject a second local command.
+            ssh_cmd = self._build_command(
+                host=str(host),
+                command=str(command),
+                user=str(user),
+                port=int(port),
+                key_file=str(key_file),
+            )
 
             result = subprocess.run(
                 ssh_cmd,
-                shell=True,
+                shell=False,  # ssh_cmd is an argument list; never a shell string
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -74,6 +79,26 @@ class SSHAdapter:
             return self._error(certificate_id, proposal.id, started_at, f"SSH operation timed out after {self.default_timeout}s")
         except Exception as e:
             return self._error(certificate_id, proposal.id, started_at, str(e))
+
+    def _build_command(
+        self,
+        host: str,
+        command: str,
+        user: str,
+        port: int,
+        key_file: str,
+    ) -> list[str]:
+        """Build the ssh argv list (shell=False, no local injection possible)."""
+        cmd = [
+            "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ConnectTimeout=10",
+            "-p", str(port),
+        ]
+        if key_file:
+            cmd += ["-i", key_file]
+        cmd += [f"{user}@{host}", command]
+        return cmd
 
     def _error(self, cert_id: str, proposal_id: str, started_at: float, msg: str) -> ExecutionResult:
         return ExecutionResult(

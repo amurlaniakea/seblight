@@ -501,5 +501,132 @@ class TestSovereignExecutionBroker:
 
 
 # ==========================================
+# Adapter Safety Tests (T2 auditoría 2026-08-11)
+# ==========================================
+
+
+class TestAdapterSafety:
+    """T2: los adapters no deben construir shell strings (sin shell=True)."""
+
+    def test_docker_volume_root_mount_rejected(self) -> None:
+        """PoC T2: volumes=['/:/host'] debe ser rechazado por el ADAPTER
+        (no solo 'no matcheado por policy')."""
+        from seblight.adapters.docker_adapter import DockerAdapter
+        adapter = DockerAdapter()
+        p = Proposal(
+            action="run container",
+            proposal_type=ProposalType.DOCKER,
+            payload={"operation": "run", "image": "nginx", "volumes": ["/:/host"]},
+            actor="test",
+        )
+        result = adapter.execute(p, certificate_id="cert-1")
+        assert result.success is False
+        assert "sensitive host path" in result.error
+
+    def test_docker_volume_etc_rejected(self) -> None:
+        from seblight.adapters.docker_adapter import DockerAdapter
+        adapter = DockerAdapter()
+        p = Proposal(
+            action="run container",
+            proposal_type=ProposalType.DOCKER,
+            payload={
+                "operation": "run",
+                "image": "nginx",
+                "volumes": ["/etc/passwd:/etc/passwd:ro"],
+            },
+            actor="test",
+        )
+        result = adapter.execute(p, certificate_id="cert-1")
+        assert result.success is False
+        assert "sensitive host path" in result.error
+
+    def test_docker_safe_volume_allowed_and_no_shell(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Un volume benigno se construye como LISTA de args y se ejecuta
+        con shell=False."""
+        from seblight.adapters.docker_adapter import DockerAdapter
+        captured: dict = {}
+
+        def fake_run(cmd: list[str], **kwargs: object) -> object:
+            captured["cmd"] = cmd
+            captured["shell"] = kwargs.get("shell")
+            return type("R", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+        monkeypatch.setattr("seblight.adapters.docker_adapter.subprocess.run", fake_run)
+        adapter = DockerAdapter()
+        p = Proposal(
+            action="run container",
+            proposal_type=ProposalType.DOCKER,
+            payload={
+                "operation": "run",
+                "image": "busybox",
+                "volumes": ["/tmp/data:/data"],
+                "env": {"A": "b"},
+                "command": "echo hi",
+            },
+            actor="test",
+        )
+        result = adapter.execute(p, certificate_id="cert-1")
+        assert result.success is True
+        assert captured["shell"] is False
+        assert captured["cmd"][0] == "docker"
+        assert "/tmp/data:/data" in captured["cmd"]
+        assert captured["cmd"][-2:] == ["echo", "hi"]
+
+    def test_ssh_host_cannot_inject_second_command(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """PoC T2: host='x; rm -rf ~' NO puede inyectar un segundo comando:
+        todo el destino es UN argv y subprocess corre sin shell."""
+        from seblight.adapters.ssh_adapter import SSHAdapter
+        captured: dict = {}
+
+        def fake_run(cmd: list[str], **kwargs: object) -> object:
+            captured["cmd"] = cmd
+            captured["shell"] = kwargs.get("shell")
+            return type("R", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+        monkeypatch.setattr("seblight.adapters.ssh_adapter.subprocess.run", fake_run)
+        adapter = SSHAdapter()
+        p = Proposal(
+            action="run remote",
+            proposal_type=ProposalType.SSH,
+            payload={"host": "x; rm -rf ~", "command": "echo hi"},
+            actor="test",
+        )
+        result = adapter.execute(p, certificate_id="cert-1")
+        assert result.success is True
+        assert captured["shell"] is False
+        # El ';' hostil vive DENTRO de un único argv (user@host): no hay shell
+        # local que lo interprete y no existe ningún segundo comando.
+        assert "root@x; rm -rf ~" in captured["cmd"]
+        assert captured["cmd"][-1] == "echo hi"
+
+    def test_ssh_key_file_is_isolated_argv(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """key_file con caracteres raros no puede romper la línea de comandos."""
+        from seblight.adapters.ssh_adapter import SSHAdapter
+        captured: dict = {}
+
+        def fake_run(cmd: list[str], **kwargs: object) -> object:
+            captured["cmd"] = cmd
+            captured["shell"] = kwargs.get("shell")
+            return type("R", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+        monkeypatch.setattr("seblight.adapters.ssh_adapter.subprocess.run", fake_run)
+        adapter = SSHAdapter()
+        p = Proposal(
+            action="run remote",
+            proposal_type=ProposalType.SSH,
+            payload={
+                "host": "example.com",
+                "command": "echo hi",
+                "key_file": "/tmp/my key; touch /tmp/pwned",
+            },
+            actor="test",
+        )
+        result = adapter.execute(p, certificate_id="cert-1")
+        assert result.success is True
+        assert captured["shell"] is False
+        assert "/tmp/my key; touch /tmp/pwned" in captured["cmd"]
+
+
+# ==========================================
 # Run with: pytest tests/ -v
 # ==========================================
