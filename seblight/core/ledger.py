@@ -24,12 +24,24 @@ class Ledger:
     Each entry contains the hash of the previous entry, forming a chain.
     """
 
-    def __init__(self, log_file: str | None = None):
+    def __init__(self, log_file: str | None = None, secret_key: str | None = None):
+        if not secret_key:
+            raise ValueError(
+                "Ledger requires a secret_key for HMAC-signed hash chaining. "
+                "Without a key the chain is forgeable (any writer can rewrite "
+                "entries and recompute hashes). Pass the same secret_key used "
+                "by the PolicyEngine (see BrokerConfig / ~/.hermes/.env)."
+            )
+        self.secret_key = secret_key
         self.entries: list[LedgerEntry] = []
         self.log_file = log_file
 
         if log_file and Path(log_file).exists():
             self._load_from_file(log_file)
+
+    def _hash(self, entry: LedgerEntry) -> str:
+        """HMAC-SHA256 of an entry using this ledger's secret key."""
+        return entry.hash(self.secret_key)
 
     def append(
         self,
@@ -39,7 +51,7 @@ class Ledger:
         certificate_id: str = "",
     ) -> LedgerEntry:
         """Append a new entry to the ledger."""
-        previous_hash = self.entries[-1].hash() if self.entries else ""
+        previous_hash = self._hash(self.entries[-1]) if self.entries else ""
 
         entry = LedgerEntry(
             event_type=event_type,
@@ -66,7 +78,7 @@ class Ledger:
             if i == 0:
                 continue
 
-            expected_previous = self.entries[i - 1].hash()
+            expected_previous = self._hash(self.entries[i - 1])
             if entry.previous_hash != expected_previous:
                 return False, entry.id
 
@@ -93,7 +105,7 @@ class Ledger:
                     "certificate_id": e.certificate_id,
                     "details": e.details,
                     "previous_hash": e.previous_hash,
-                    "hash": e.hash(),
+                    "hash": self._hash(e),
                 }
                 for e in entries
             ],
@@ -110,7 +122,7 @@ class Ledger:
             "certificate_id": entry.certificate_id,
             "details": entry.details,
             "previous_hash": entry.previous_hash,
-            "hash": entry.hash(),
+            "hash": self._hash(entry),
         }
         with open(self.log_file, "a") as f:
             f.write(json.dumps(data) + "\n")

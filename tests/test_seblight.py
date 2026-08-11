@@ -106,12 +106,17 @@ class TestCertificate:
 class TestLedgerEntry:
     def test_hash_consistency(self):
         e = LedgerEntry(event_type="TEST", timestamp=1.0, proposal_id="p1")
-        assert e.hash() == e.hash()
+        assert e.hash("test-key") == e.hash("test-key")
 
     def test_hash_uniqueness(self):
         e1 = LedgerEntry(event_type="TEST1", timestamp=1.0, proposal_id="p1")
         e2 = LedgerEntry(event_type="TEST2", timestamp=2.0, proposal_id="p2")
-        assert e1.hash() != e2.hash()
+        assert e1.hash("test-key") != e2.hash("test-key")
+
+    def test_hash_is_keyed_hmac(self):
+        """Same entry hashed with different keys must differ (HMAC, not plain SHA-256)."""
+        e = LedgerEntry(event_type="TEST", timestamp=1.0, proposal_id="p1")
+        assert e.hash("key-a") != e.hash("key-b")
 
 
 # ==========================================
@@ -276,14 +281,19 @@ class TestCommandExecutor:
 
 
 class TestLedger:
+    def test_requires_secret_key(self):
+        """Fail closed: a ledger without a key must refuse to start."""
+        with pytest.raises(ValueError):
+            Ledger()
+
     def test_append(self):
-        ledger = Ledger()
+        ledger = Ledger(secret_key="test-key")
         entry = ledger.append("TEST", "p1", {"key": "value"})
         assert ledger.size == 1
         assert entry.event_type == "TEST"
 
     def test_chain_integrity(self):
-        ledger = Ledger()
+        ledger = Ledger(secret_key="test-key")
         ledger.append("STEP1", "p1")
         ledger.append("STEP2", "p1")
         ledger.append("STEP3", "p2")
@@ -292,7 +302,7 @@ class TestLedger:
         assert broken is None
 
     def test_chain_broken(self):
-        ledger = Ledger()
+        ledger = Ledger(secret_key="test-key")
         e1 = ledger.append("STEP1", "p1")
         e2 = ledger.append("STEP2", "p1")
         # Tamper with the chain
@@ -300,8 +310,65 @@ class TestLedger:
         valid, broken = ledger.verify_integrity()
         assert valid is False
 
+    def test_wrong_key_breaks_chain(self, tmp_path):
+        """Reloading the same log with a different key must fail verification."""
+        log_file = str(tmp_path / "ledger.jsonl")
+        ledger = Ledger(log_file=log_file, secret_key="real-key")
+        ledger.append("STEP1", "p1")
+        ledger.append("STEP2", "p1")
+
+        ledger2 = Ledger(log_file=log_file, secret_key="wrong-key")
+        valid, broken = ledger2.verify_integrity()
+        assert valid is False
+        assert broken is not None
+
+    def test_tampered_jsonl_detected_with_hmac(self, tmp_path):
+        """PoC T3: tamper a .jsonl line + naive sha256 chain recomputation
+        (attacker without the key) must still fail verify_integrity()."""
+        import hashlib
+
+        log_file = str(tmp_path / "ledger.jsonl")
+        key = "correct-secret"
+        ledger = Ledger(log_file=log_file, secret_key=key)
+        ledger.append("STEP1", "p1")
+        ledger.append("STEP2", "p1")
+        ledger.append("STEP3", "p2")
+
+        # Attacker rewrites entry B (details) and recomputes the chain NAIVELY
+        # with plain SHA-256 (they don't know the HMAC key).
+        lines = open(log_file).read().splitlines()
+        a = json.loads(lines[0])
+        b = json.loads(lines[1])
+        c = json.loads(lines[2])
+
+        b["details"]["evil"] = True
+
+        def naive_sha256(d: dict) -> str:
+            payload = json.dumps({
+                "id": d["id"],
+                "event_type": d["event_type"],
+                "timestamp": d["timestamp"],
+                "proposal_id": d["proposal_id"],
+                "certificate_id": d["certificate_id"],
+                "details": d["details"],
+                "previous_hash": d["previous_hash"],
+            }, sort_keys=True)
+            return hashlib.sha256(payload.encode()).hexdigest()
+
+        b["previous_hash"] = naive_sha256(a)
+        c["previous_hash"] = naive_sha256(b)
+
+        with open(log_file, "w") as f:
+            f.write("\n".join(json.dumps(x) for x in (a, b, c)) + "\n")
+
+        # Reload with the CORRECT key: the naive sha256 chain must NOT verify.
+        ledger2 = Ledger(log_file=log_file, secret_key=key)
+        valid, broken = ledger2.verify_integrity()
+        assert valid is False
+        assert broken is not None
+
     def test_get_entries_for_proposal(self):
-        ledger = Ledger()
+        ledger = Ledger(secret_key="test-key")
         ledger.append("E1", "p1")
         ledger.append("E2", "p2")
         ledger.append("E3", "p1")
@@ -309,7 +376,7 @@ class TestLedger:
         assert len(entries) == 2
 
     def test_export_json(self):
-        ledger = Ledger()
+        ledger = Ledger(secret_key="test-key")
         ledger.append("TEST", "p1", {"action": "test"})
         json_str = ledger.export_json("p1")
         data = json.loads(json_str)
@@ -324,7 +391,7 @@ class TestLedger:
 
 class TestSovereignExecutionBroker:
     def setup_method(self):
-        self.config = BrokerConfig(dry_run=True)
+        self.config = BrokerConfig(dry_run=True, secret_key="test-secret-key")
         self.broker = SovereignExecutionBroker(self.config)
 
     def test_safe_proposal_flow(self):
@@ -379,7 +446,7 @@ class TestSovereignExecutionBroker:
         assert stats["ledger_integrity"] is True
 
     def test_with_real_execution(self):
-        config = BrokerConfig(dry_run=False)
+        config = BrokerConfig(dry_run=False, secret_key="test-secret-key")
         broker = SovereignExecutionBroker(config)
         p = Proposal(
             action="echo hello",

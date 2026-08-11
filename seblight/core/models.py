@@ -11,6 +11,7 @@ Core data structures: Proposal, Certificate, Policy, ExecutionResult
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import time
 import uuid
@@ -186,8 +187,13 @@ class LedgerEntry:
     previous_hash: str = ""              # Hash chain for integrity
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
-    def hash(self) -> str:
-        """Compute hash of this entry for chain integrity."""
+    def hash(self, secret_key: str) -> str:
+        """Compute HMAC-SHA256 of this entry for chain integrity.
+
+        The chain is keyed (HMAC) so that an attacker who can write to the
+        ledger log cannot rewrite an entry and recompute the chain without
+        knowing the secret key. Plain SHA-256 would be forgeable.
+        """
         data = json.dumps({
             "id": self.id,
             "event_type": self.event_type,
@@ -197,4 +203,8 @@ class LedgerEntry:
             "details": self.details,
             "previous_hash": self.previous_hash,
         }, sort_keys=True)
-        return hashlib.sha256(data.encode()).hexdigest()
+        return hmac.new(
+            secret_key.encode(),
+            data.encode(),
+            hashlib.sha256,
+        ).hexdigest()
