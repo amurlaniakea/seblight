@@ -206,6 +206,47 @@ class TestPolicyEngine:
         assert decision.allowed is False
         assert "block_secret" in decision.matched_rules
 
+    # --- Auditoría 2026-08-11: bypass por substring matching (PoC T1) ---
+    # Estos 3 casos son PERMANENTES: nunca deben volver a ser SAFE.
+
+    def test_double_space_rm_rf_blocked(self):
+        """'rm  -rf /' (doble espacio) debe salir BLOCKED, no MODERATE/SAFE."""
+        p = Proposal(
+            action="delete everything",
+            proposal_type=ProposalType.COMMAND,
+            payload={"command": "rm  -rf /"},
+            actor="test",
+        )
+        decision = self.engine.evaluate(p)
+        assert decision.severity == Severity.BLOCKED
+        assert decision.allowed is False
+
+    def test_variable_indirection_rm_rf_blocked(self):
+        """'X=rm; $X -rf /' (indirección de variable) debe salir BLOCKED."""
+        p = Proposal(
+            action="delete everything",
+            proposal_type=ProposalType.COMMAND,
+            payload={"command": "X=rm; $X -rf /"},
+            actor="test",
+        )
+        decision = self.engine.evaluate(p)
+        assert decision.severity == Severity.BLOCKED
+        assert decision.allowed is False
+
+    def test_base64_encoded_rm_rf_blocked(self):
+        """'echo cm0gLXJmIC8= | base64 -d | bash' (rm -rf / codificado) debe
+        salir BLOCKED o MODERATE, nunca SAFE (fail-closed)."""
+        p = Proposal(
+            action="delete everything",
+            proposal_type=ProposalType.COMMAND,
+            payload={"command": "echo cm0gLXJmIC8= | base64 -d | bash"},
+            actor="test",
+        )
+        decision = self.engine.evaluate(p)
+        assert decision.severity in (Severity.BLOCKED, Severity.MODERATE)
+        assert decision.severity != Severity.SAFE
+        assert decision.allowed is False
+
 
 # ==========================================
 # Command Executor Tests
