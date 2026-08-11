@@ -13,6 +13,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import shlex
@@ -154,7 +155,7 @@ def _base64_candidate(token: str) -> bool:
 
 
 def detect_encoded_command(content: str) -> Severity | None:
-    """Fail-closed detector for encoded/obfuscated command content.
+    """Fail-closed detector for encoded/obfuscated command content (capa T1).
 
     Returns:
       - BLOCKED if base64/hex content decodes to a dangerous command;
@@ -201,6 +202,111 @@ def detect_encoded_command(content: str) -> Severity | None:
     # Encoded content piped into a shell: cannot resolve statically -> fail closed.
     if _PIPE_TO_SHELL_RE.search(content):
         return Severity.MODERATE
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Structural detection (capa T4) — forma del ataque, no nombres de programa
+# ---------------------------------------------------------------------------
+#
+# DEPTH-IN-DEFENSE, NOT A COMPLETE SOLUTION: esta capa detecta la FORMA del
+# ataque (algo se transforma y luego se ejecuta, o hay tokens de alta entropía
+# en un contexto de ejecución), independientemente del alfabeto de codificación
+# (base32/base58/base85/base91/hex/ASCII85/url-encoding/rot13-via-tr/...).
+# Un agente capaz de ejecutar código arbitrario (ej. `python3 -c` construyendo
+# un string byte a byte con chr(114)+chr(109)+...) NO es detectable por análisis
+# estático de texto; eso requeriría sandboxing o restringir qué binarios puede
+# invocar el agente, no matching de patrones.
+
+_INTERPRETER_TOKENS = frozenset({
+    "bash", "sh", "zsh", "python", "python3", "perl", "ruby", "node",
+    "eval", "source", "exec",
+})
+_SUSPICIOUS_ENTROPY_MIN = 3.5   # bits/char — calibrar con uso real si hace falta
+_SUSPICIOUS_TOKEN_MIN_LEN = 12
+_SUSPICIOUS_ALNUM_RATIO_MAX = 0.9
+_REDIR_OR_SUBSHELL_RE = re.compile(r"[><&;()]")
+
+
+def _shannon_entropy(token: str) -> float:
+    """Shannon entropy of a token in bits per character."""
+    if not token:
+        return 0.0
+    counts: dict[str, int] = {}
+    for ch in token:
+        counts[ch] = counts.get(ch, 0) + 1
+    n = len(token)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+def _pipeline_segments(content: str) -> list[list[str]]:
+    """Tokenize with shlex and split on pipe tokens (quotes respected)."""
+    try:
+        tokens = shlex.split(content)
+    except ValueError:
+        return [content.split()]
+    segments: list[list[str]] = [[]]
+    for t in tokens:
+        if t == "|":
+            segments.append([])
+        else:
+            segments[-1].append(t)
+    return segments
+
+
+def _has_execution_context(content: str) -> bool:
+    """True if the command contains a pipe, redirection or subshell."""
+    return "|" in content or _REDIR_OR_SUBSHELL_RE.search(content) is not None
+
+
+def _is_suspicious_encoded_token(token: str) -> bool:
+    """High-entropy, non-dictionary token → likely encoded/obfuscated content.
+
+    Criteria: length >= 12, Shannon entropy >= ~3.5 bits/char, and a LOW ratio
+    of plain alphanumeric+space characters (hex hashes are all-alnum and are
+    NOT flagged; base32/85/91 and other alphabets with '=', '%', '~', etc. are).
+    """
+    if len(token) < _SUSPICIOUS_TOKEN_MIN_LEN:
+        return False
+    if _shannon_entropy(token) < _SUSPICIOUS_ENTROPY_MIN:
+        return False
+    alnum_ratio = sum(1 for c in token if c.isalnum() or c.isspace()) / len(token)
+    return alnum_ratio < _SUSPICIOUS_ALNUM_RATIO_MAX
+
+
+def detect_structural_suspicion(content: str) -> Severity | None:
+    """Fail-closed structural detector (capa T4), independent of encoding names.
+
+    Rule 1 — pipeline into an interpreter: if ANY pipeline segment (not only the
+    last one) invokes a shell/language interpreter (bash/sh/zsh/python/perl/
+    ruby/node/eval/source/exec), the command is MODERATE at minimum. We do not
+    try to decode what feeds the pipe: \"something is transformed and then
+    executed\" is suspicious by itself, whatever the encoding. Text utilities
+    (grep, wc, xargs, cat, awk...) are NOT interpreters and do NOT trigger.
+
+    Rule 2 — entropy heuristic: any token >= 12 chars with high Shannon entropy
+    and a low ratio of plain alnum+space characters is suspicious of being
+    encoded content regardless of the alphabet. It raises to MODERATE only when
+    combined with a pipe/redirection/subshell in the same command (an isolated
+    payload with no execution context is not blocked).
+
+    Returns MODERATE or None (never BLOCKED: that stays in the T1 signature
+    layer when the decoded content matches dangerous patterns).
+    """
+    segments = _pipeline_segments(content)
+
+    # Rule 1: pipe into an interpreter.
+    if len(segments) > 1 and any(
+        seg and seg[0] in _INTERPRETER_TOKENS for seg in segments
+    ):
+        return Severity.MODERATE
+
+    # Rule 2: high-entropy encoded token inside an execution context.
+    if _has_execution_context(content):
+        for token in (t for seg in segments for t in seg):
+            if _is_suspicious_encoded_token(token):
+                return Severity.MODERATE
 
     return None
 
@@ -323,8 +429,9 @@ class PolicyEngine:
             matched_rules.append(f"encoded_{encoded_sev.value}")
             reasons.append(
                 f"[{encoded_sev.value.upper()}] Encoded/obfuscated command payload "
-                "(base64/hex/rot13 or pipe to shell) — cannot be statically "
-                "resolved as safe; failing closed"
+                "(encoded content, pipeline into an interpreter, or high-entropy "
+                "token in an execution context) — cannot be statically resolved "
+                "as safe; failing closed"
             )
             if encoded_sev == Severity.BLOCKED:
                 max_severity = Severity.BLOCKED
@@ -347,12 +454,20 @@ class PolicyEngine:
         )
 
     def _detect_encoded(self, proposal: Proposal) -> Severity | None:
-        """Worst-case encoded-command severity across all payload strings."""
+        """Worst-case encoded-command severity across all payload strings.
+
+        Combines the T1 signature layer (base64/hex decode -> BLOCKED possible)
+        with the T4 structural layer (pipeline-into-interpreter / high-entropy
+        token in an execution context -> MODERATE at minimum).
+        """
         worst: Severity | None = None
         for s in _iter_payload_strings(proposal.payload):
             sev = detect_encoded_command(s)
             if sev == Severity.BLOCKED:
                 return Severity.BLOCKED
+            if sev == Severity.MODERATE:
+                worst = Severity.MODERATE
+            sev = detect_structural_suspicion(s)
             if sev == Severity.MODERATE:
                 worst = Severity.MODERATE
         return worst

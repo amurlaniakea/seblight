@@ -249,6 +249,59 @@ class TestPolicyEngine:
 
 
 # ==========================================
+# Detección estructural T4 (auditoría 2026-08-11)
+# ==========================================
+
+
+class TestStructuralEncodingDetection:
+    """T4: detección por FORMA (pipe a intérprete / entropía), no por nombres
+    de programa. Tests PERMANENTES: nunca deben volver a ser SAFE."""
+
+    # PoC de bypass de la capa de firmas T1 (todos 'rm -rf /' disfrazado).
+    BYPASS_POCS = [
+        "echo OJWSALLSMYQC6=== | base32 -d | bash",
+        "echo a%~_ja%Lbe | base85 -d | bash",
+        'echo "ez -es /" | tr "A-Za-z" "N-ZA-Mn-za-m" | bash',
+        'printf "%b" "rm%20-rf%20/" | bash',
+    ]
+
+    # Pipelines de lectura legítimos que NO deben disparar.
+    BENIGN_PIPELINES = [
+        "cat f.txt | grep error",
+        "ls -la | wc -l",
+        'find . -name "*.py" | xargs cat',
+        "ps aux | grep python",
+        "docker logs -f mycontainer",
+    ]
+
+    def setup_method(self) -> None:
+        self.engine = PolicyEngine(secret_key="test-key")
+
+    @pytest.mark.parametrize("cmd", BYPASS_POCS)
+    def test_bypass_pocs_never_safe(self, cmd: str) -> None:
+        p = Proposal(
+            action="delete everything",
+            proposal_type=ProposalType.COMMAND,
+            payload={"command": cmd},
+            actor="test",
+        )
+        decision = self.engine.evaluate(p)
+        assert decision.severity in (Severity.MODERATE, Severity.BLOCKED), cmd
+        assert decision.severity != Severity.SAFE
+
+    @pytest.mark.parametrize("cmd", BENIGN_PIPELINES)
+    def test_benign_pipelines_stay_safe(self, cmd: str) -> None:
+        p = Proposal(
+            action="read/logs",
+            proposal_type=ProposalType.COMMAND,
+            payload={"command": cmd},
+            actor="test",
+        )
+        decision = self.engine.evaluate(p)
+        assert decision.severity == Severity.SAFE, cmd
+
+
+# ==========================================
 # Command Executor Tests
 # ==========================================
 
