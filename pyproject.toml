@@ -7,7 +7,8 @@ name = "seblight"
 version = "0.1.0"
 description = "Sovereign Execution Broker — certificate-bound authority for agent command execution"
 readme = "README.md"
-license = {text = "AGPL-3.0-or-later"}
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
 authors = [
     {name = "Pedro Sordo Martínez", email = "amurlaniakea@gmail.com"},
 ]
@@ -15,7 +16,6 @@ requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Topic :: Security",
-    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",

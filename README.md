@@ -4,6 +4,8 @@
 
 Enforces certificate-bound authority before executing any shell command. Based on the paper ["Sovereign Execution Brokers: Enforcing Certificate-Bound Authority in Agentic Control Planes"](https://arxiv.org/abs/2606.20520) (arXiv:2606.20520, Jun 2026).
 
+[![License: AGPL-3.0-or-later](https://img.shields.io/badge/License-AGPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/agpl-3.0.html)
+
 ## The Problem
 
 When an autonomous AI agent has direct access credentials to production infrastructure, a single hallucination or prompt injection can cause:
@@ -151,7 +153,11 @@ python3 /home/sil/seblight/seblight_run.py execute "action" "command"
 
 ## License
 
-AGPL-3.0 — Copyright (C) 2026 Pedro Sordo Martínez <amurlaniakea@gmail.com>
+This project is licensed under the **GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)**, per the [Free Software Foundation](https://www.gnu.org/licenses/agpl-3.0.html). The full license text is in [LICENSE](./LICENSE).
+
+**Source access (AGPL §13):** SEB-Light is a local CLI/broker, not a network service, so §13 does not apply in practice. The complete source is published at [github.com/amurlaniakea/seblight](https://github.com/amurlaniakea/seblight); copies can be requested from [amurlaniakea@gmail.com](mailto:amurlaniakea@gmail.com).
+
+Copyright (C) 2026 Pedro Sordo Martínez <amurlaniakea@gmail.com>
 
 ## References
 
