@@ -106,12 +106,17 @@ class TestCertificate:
 class TestLedgerEntry:
     def test_hash_consistency(self):
         e = LedgerEntry(event_type="TEST", timestamp=1.0, proposal_id="p1")
-        assert e.hash() == e.hash()
+        assert e.hash("test-key") == e.hash("test-key")
 
     def test_hash_uniqueness(self):
         e1 = LedgerEntry(event_type="TEST1", timestamp=1.0, proposal_id="p1")
         e2 = LedgerEntry(event_type="TEST2", timestamp=2.0, proposal_id="p2")
-        assert e1.hash() != e2.hash()
+        assert e1.hash("test-key") != e2.hash("test-key")
+
+    def test_hash_is_keyed_hmac(self):
+        """Same entry hashed with different keys must differ (HMAC, not plain SHA-256)."""
+        e = LedgerEntry(event_type="TEST", timestamp=1.0, proposal_id="p1")
+        assert e.hash("key-a") != e.hash("key-b")
 
 
 # ==========================================
@@ -201,6 +206,47 @@ class TestPolicyEngine:
         assert decision.allowed is False
         assert "block_secret" in decision.matched_rules
 
+    # --- Auditoría 2026-08-11: bypass por substring matching (PoC T1) ---
+    # Estos 3 casos son PERMANENTES: nunca deben volver a ser SAFE.
+
+    def test_double_space_rm_rf_blocked(self):
+        """'rm  -rf /' (doble espacio) debe salir BLOCKED, no MODERATE/SAFE."""
+        p = Proposal(
+            action="delete everything",
+            proposal_type=ProposalType.COMMAND,
+            payload={"command": "rm  -rf /"},
+            actor="test",
+        )
+        decision = self.engine.evaluate(p)
+        assert decision.severity == Severity.BLOCKED
+        assert decision.allowed is False
+
+    def test_variable_indirection_rm_rf_blocked(self):
+        """'X=rm; $X -rf /' (indirección de variable) debe salir BLOCKED."""
+        p = Proposal(
+            action="delete everything",
+            proposal_type=ProposalType.COMMAND,
+            payload={"command": "X=rm; $X -rf /"},
+            actor="test",
+        )
+        decision = self.engine.evaluate(p)
+        assert decision.severity == Severity.BLOCKED
+        assert decision.allowed is False
+
+    def test_base64_encoded_rm_rf_blocked(self):
+        """'echo cm0gLXJmIC8= | base64 -d | bash' (rm -rf / codificado) debe
+        salir BLOCKED o MODERATE, nunca SAFE (fail-closed)."""
+        p = Proposal(
+            action="delete everything",
+            proposal_type=ProposalType.COMMAND,
+            payload={"command": "echo cm0gLXJmIC8= | base64 -d | bash"},
+            actor="test",
+        )
+        decision = self.engine.evaluate(p)
+        assert decision.severity in (Severity.BLOCKED, Severity.MODERATE)
+        assert decision.severity != Severity.SAFE
+        assert decision.allowed is False
+
 
 # ==========================================
 # Command Executor Tests
@@ -276,14 +322,19 @@ class TestCommandExecutor:
 
 
 class TestLedger:
+    def test_requires_secret_key(self):
+        """Fail closed: a ledger without a key must refuse to start."""
+        with pytest.raises(ValueError):
+            Ledger()
+
     def test_append(self):
-        ledger = Ledger()
+        ledger = Ledger(secret_key="test-key")
         entry = ledger.append("TEST", "p1", {"key": "value"})
         assert ledger.size == 1
         assert entry.event_type == "TEST"
 
     def test_chain_integrity(self):
-        ledger = Ledger()
+        ledger = Ledger(secret_key="test-key")
         ledger.append("STEP1", "p1")
         ledger.append("STEP2", "p1")
         ledger.append("STEP3", "p2")
@@ -292,7 +343,7 @@ class TestLedger:
         assert broken is None
 
     def test_chain_broken(self):
-        ledger = Ledger()
+        ledger = Ledger(secret_key="test-key")
         e1 = ledger.append("STEP1", "p1")
         e2 = ledger.append("STEP2", "p1")
         # Tamper with the chain
@@ -300,8 +351,65 @@ class TestLedger:
         valid, broken = ledger.verify_integrity()
         assert valid is False
 
+    def test_wrong_key_breaks_chain(self, tmp_path):
+        """Reloading the same log with a different key must fail verification."""
+        log_file = str(tmp_path / "ledger.jsonl")
+        ledger = Ledger(log_file=log_file, secret_key="real-key")
+        ledger.append("STEP1", "p1")
+        ledger.append("STEP2", "p1")
+
+        ledger2 = Ledger(log_file=log_file, secret_key="wrong-key")
+        valid, broken = ledger2.verify_integrity()
+        assert valid is False
+        assert broken is not None
+
+    def test_tampered_jsonl_detected_with_hmac(self, tmp_path):
+        """PoC T3: tamper a .jsonl line + naive sha256 chain recomputation
+        (attacker without the key) must still fail verify_integrity()."""
+        import hashlib
+
+        log_file = str(tmp_path / "ledger.jsonl")
+        key = "correct-secret"
+        ledger = Ledger(log_file=log_file, secret_key=key)
+        ledger.append("STEP1", "p1")
+        ledger.append("STEP2", "p1")
+        ledger.append("STEP3", "p2")
+
+        # Attacker rewrites entry B (details) and recomputes the chain NAIVELY
+        # with plain SHA-256 (they don't know the HMAC key).
+        lines = open(log_file).read().splitlines()
+        a = json.loads(lines[0])
+        b = json.loads(lines[1])
+        c = json.loads(lines[2])
+
+        b["details"]["evil"] = True
+
+        def naive_sha256(d: dict) -> str:
+            payload = json.dumps({
+                "id": d["id"],
+                "event_type": d["event_type"],
+                "timestamp": d["timestamp"],
+                "proposal_id": d["proposal_id"],
+                "certificate_id": d["certificate_id"],
+                "details": d["details"],
+                "previous_hash": d["previous_hash"],
+            }, sort_keys=True)
+            return hashlib.sha256(payload.encode()).hexdigest()
+
+        b["previous_hash"] = naive_sha256(a)
+        c["previous_hash"] = naive_sha256(b)
+
+        with open(log_file, "w") as f:
+            f.write("\n".join(json.dumps(x) for x in (a, b, c)) + "\n")
+
+        # Reload with the CORRECT key: the naive sha256 chain must NOT verify.
+        ledger2 = Ledger(log_file=log_file, secret_key=key)
+        valid, broken = ledger2.verify_integrity()
+        assert valid is False
+        assert broken is not None
+
     def test_get_entries_for_proposal(self):
-        ledger = Ledger()
+        ledger = Ledger(secret_key="test-key")
         ledger.append("E1", "p1")
         ledger.append("E2", "p2")
         ledger.append("E3", "p1")
@@ -309,7 +417,7 @@ class TestLedger:
         assert len(entries) == 2
 
     def test_export_json(self):
-        ledger = Ledger()
+        ledger = Ledger(secret_key="test-key")
         ledger.append("TEST", "p1", {"action": "test"})
         json_str = ledger.export_json("p1")
         data = json.loads(json_str)
@@ -324,7 +432,7 @@ class TestLedger:
 
 class TestSovereignExecutionBroker:
     def setup_method(self):
-        self.config = BrokerConfig(dry_run=True)
+        self.config = BrokerConfig(dry_run=True, secret_key="test-secret-key")
         self.broker = SovereignExecutionBroker(self.config)
 
     def test_safe_proposal_flow(self):
@@ -379,7 +487,7 @@ class TestSovereignExecutionBroker:
         assert stats["ledger_integrity"] is True
 
     def test_with_real_execution(self):
-        config = BrokerConfig(dry_run=False)
+        config = BrokerConfig(dry_run=False, secret_key="test-secret-key")
         broker = SovereignExecutionBroker(config)
         p = Proposal(
             action="echo hello",
@@ -390,6 +498,133 @@ class TestSovereignExecutionBroker:
         result = broker.process_proposal(p)
         assert result["status"] == ExecutionStatus.EXECUTED.value
         assert "seblight works" in result["execution"]["output"]
+
+
+# ==========================================
+# Adapter Safety Tests (T2 auditoría 2026-08-11)
+# ==========================================
+
+
+class TestAdapterSafety:
+    """T2: los adapters no deben construir shell strings (sin shell=True)."""
+
+    def test_docker_volume_root_mount_rejected(self) -> None:
+        """PoC T2: volumes=['/:/host'] debe ser rechazado por el ADAPTER
+        (no solo 'no matcheado por policy')."""
+        from seblight.adapters.docker_adapter import DockerAdapter
+        adapter = DockerAdapter()
+        p = Proposal(
+            action="run container",
+            proposal_type=ProposalType.DOCKER,
+            payload={"operation": "run", "image": "nginx", "volumes": ["/:/host"]},
+            actor="test",
+        )
+        result = adapter.execute(p, certificate_id="cert-1")
+        assert result.success is False
+        assert "sensitive host path" in result.error
+
+    def test_docker_volume_etc_rejected(self) -> None:
+        from seblight.adapters.docker_adapter import DockerAdapter
+        adapter = DockerAdapter()
+        p = Proposal(
+            action="run container",
+            proposal_type=ProposalType.DOCKER,
+            payload={
+                "operation": "run",
+                "image": "nginx",
+                "volumes": ["/etc/passwd:/etc/passwd:ro"],
+            },
+            actor="test",
+        )
+        result = adapter.execute(p, certificate_id="cert-1")
+        assert result.success is False
+        assert "sensitive host path" in result.error
+
+    def test_docker_safe_volume_allowed_and_no_shell(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Un volume benigno se construye como LISTA de args y se ejecuta
+        con shell=False."""
+        from seblight.adapters.docker_adapter import DockerAdapter
+        captured: dict = {}
+
+        def fake_run(cmd: list[str], **kwargs: object) -> object:
+            captured["cmd"] = cmd
+            captured["shell"] = kwargs.get("shell")
+            return type("R", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+        monkeypatch.setattr("seblight.adapters.docker_adapter.subprocess.run", fake_run)
+        adapter = DockerAdapter()
+        p = Proposal(
+            action="run container",
+            proposal_type=ProposalType.DOCKER,
+            payload={
+                "operation": "run",
+                "image": "busybox",
+                "volumes": ["/tmp/data:/data"],
+                "env": {"A": "b"},
+                "command": "echo hi",
+            },
+            actor="test",
+        )
+        result = adapter.execute(p, certificate_id="cert-1")
+        assert result.success is True
+        assert captured["shell"] is False
+        assert captured["cmd"][0] == "docker"
+        assert "/tmp/data:/data" in captured["cmd"]
+        assert captured["cmd"][-2:] == ["echo", "hi"]
+
+    def test_ssh_host_cannot_inject_second_command(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """PoC T2: host='x; rm -rf ~' NO puede inyectar un segundo comando:
+        todo el destino es UN argv y subprocess corre sin shell."""
+        from seblight.adapters.ssh_adapter import SSHAdapter
+        captured: dict = {}
+
+        def fake_run(cmd: list[str], **kwargs: object) -> object:
+            captured["cmd"] = cmd
+            captured["shell"] = kwargs.get("shell")
+            return type("R", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+        monkeypatch.setattr("seblight.adapters.ssh_adapter.subprocess.run", fake_run)
+        adapter = SSHAdapter()
+        p = Proposal(
+            action="run remote",
+            proposal_type=ProposalType.SSH,
+            payload={"host": "x; rm -rf ~", "command": "echo hi"},
+            actor="test",
+        )
+        result = adapter.execute(p, certificate_id="cert-1")
+        assert result.success is True
+        assert captured["shell"] is False
+        # El ';' hostil vive DENTRO de un único argv (user@host): no hay shell
+        # local que lo interprete y no existe ningún segundo comando.
+        assert "root@x; rm -rf ~" in captured["cmd"]
+        assert captured["cmd"][-1] == "echo hi"
+
+    def test_ssh_key_file_is_isolated_argv(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """key_file con caracteres raros no puede romper la línea de comandos."""
+        from seblight.adapters.ssh_adapter import SSHAdapter
+        captured: dict = {}
+
+        def fake_run(cmd: list[str], **kwargs: object) -> object:
+            captured["cmd"] = cmd
+            captured["shell"] = kwargs.get("shell")
+            return type("R", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+        monkeypatch.setattr("seblight.adapters.ssh_adapter.subprocess.run", fake_run)
+        adapter = SSHAdapter()
+        p = Proposal(
+            action="run remote",
+            proposal_type=ProposalType.SSH,
+            payload={
+                "host": "example.com",
+                "command": "echo hi",
+                "key_file": "/tmp/my key; touch /tmp/pwned",
+            },
+            actor="test",
+        )
+        result = adapter.execute(p, certificate_id="cert-1")
+        assert result.success is True
+        assert captured["shell"] is False
+        assert "/tmp/my key; touch /tmp/pwned" in captured["cmd"]
 
 
 # ==========================================

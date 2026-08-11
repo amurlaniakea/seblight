@@ -12,8 +12,11 @@ Based on: "Sovereign Execution Brokers: Enforcing Certificate-Bound Authority
 
 from __future__ import annotations
 
+import os
+import secrets
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .executor import CommandExecutor
@@ -57,6 +60,59 @@ class BrokerConfig:
     auto_execute_safe: bool = True
 
 
+_ENV_DIR = Path.home() / ".hermes"
+_ENV_FILE = _ENV_DIR / ".env"
+_SEBLIGHT_KEY_VAR = "SEBLIGHT_SECRET_KEY"
+
+
+def resolve_secret_key(configured: str | None = None) -> str:
+    """Resolve the persistent SEB secret key (fail-closed: never random-per-process).
+
+    Resolution order:
+      1. Explicit value (BrokerConfig.secret_key)
+      2. Environment variable SEBLIGHT_SECRET_KEY
+      3. ~/.hermes/.env (KEY=VALUE line)
+      4. Generate once with secrets.token_hex(32), persist to ~/.hermes/.env
+         (append-only, chmod 600) so every process invocation uses the SAME key.
+
+    A random key per process would make the HMAC-signed ledger and certificates
+    unverifiable across invocations and defeats the threat model
+    (\"the agent can fabricate output\").
+    """
+    if configured:
+        return configured
+
+    env_value = os.environ.get(_SEBLIGHT_KEY_VAR)
+    if env_value:
+        return env_value
+
+    if _ENV_FILE.exists():
+        try:
+            for line in _ENV_FILE.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith(_SEBLIGHT_KEY_VAR + "="):
+                    value = line.split("=", 1)[1].strip().strip("\"'")
+                    if value:
+                        return value
+        except OSError:
+            pass  # fall through to generate+persist
+
+    key = secrets.token_hex(32)
+    try:
+        _ENV_DIR.mkdir(parents=True, exist_ok=True)
+        with open(_ENV_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{_SEBLIGHT_KEY_VAR}={key}\n")
+        os.chmod(_ENV_FILE, 0o600)
+    except OSError:
+        # Cannot persist (read-only FS, etc.): fail closed rather than silently
+        # using a throwaway key that breaks ledger verification across runs.
+        raise RuntimeError(
+            f"Cannot persist SEB secret key to {_ENV_FILE}. "
+            "Set SEBLIGHT_SECRET_KEY in the environment instead."
+        ) from None
+    return key
+
+
 class SovereignExecutionBroker:
     """
     The main SEB that enforces certificate-bound authority.
@@ -73,16 +129,24 @@ class SovereignExecutionBroker:
     def __init__(self, config: BrokerConfig | None = None):
         self.config = config or BrokerConfig()
 
+        # Resolve a PERSISTENT secret key shared by policy engine and ledger.
+        # (BrokerConfig.secret_key may be None; the resolver never falls back
+        # to a random per-process key.)
+        self.secret_key = resolve_secret_key(self.config.secret_key)
+
         # Initialize components
         self.policy_engine = PolicyEngine(
-            secret_key=self.config.secret_key,
+            secret_key=self.secret_key,
             policy_file=self.config.policy_file,
         )
         self.executor = CommandExecutor(
             default_timeout=self.config.default_timeout,
             max_output_bytes=self.config.max_output_bytes,
         )
-        self.ledger = Ledger(log_file=self.config.ledger_file)
+        self.ledger = Ledger(
+            log_file=self.config.ledger_file,
+            secret_key=self.secret_key,
+        )
 
         # Initialize adapters
         self.file_adapter = FileAdapter()

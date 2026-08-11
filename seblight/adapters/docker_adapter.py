@@ -9,6 +9,7 @@ Handles Docker container and image operations through SEB.
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import time
 from typing import Any
@@ -28,6 +29,9 @@ class DockerAdapter:
         "rmi -f", "rm -f",
     ]
 
+    # Host paths that must never be bind-mounted into a container
+    SENSITIVE_HOST_PATHS = ("/", "/etc", "/root", "/home")
+
     def __init__(self, default_timeout: int = 60):
         self.default_timeout = default_timeout
 
@@ -43,6 +47,18 @@ class DockerAdapter:
             if self._is_blocked(operation):
                 return self._error(certificate_id, proposal.id, started_at, f"Docker operation blocked: {operation}")
 
+            # Reject volume mounts that expose sensitive host paths (fail closed).
+            # A mount like '-v /:/host' would give the container the host root
+            # filesystem and is NOT caught by the policy engine's payload match.
+            for vol in proposal.payload.get("volumes", []):
+                if self._is_sensitive_volume(str(vol)):
+                    return self._error(
+                        certificate_id,
+                        proposal.id,
+                        started_at,
+                        f"Volume mount rejected: '{vol}' points to sensitive host path",
+                    )
+
             # Build the docker command
             cmd = self._build_command(proposal.payload)
             if not cmd:
@@ -52,7 +68,7 @@ class DockerAdapter:
 
             result = subprocess.run(
                 cmd,
-                shell=True,
+                shell=False,  # cmd is an argument list; never a shell string
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -80,8 +96,14 @@ class DockerAdapter:
         except Exception as e:
             return self._error(certificate_id, proposal.id, started_at, str(e))
 
-    def _build_command(self, payload: dict[str, Any]) -> str:
-        """Build a Docker command from payload."""
+    def _build_command(self, payload: dict[str, Any]) -> list[str] | None:
+        """Build a Docker command as an argument LIST (never a shell string).
+
+        Returning a list and running with shell=False removes shell injection
+        entirely: every payload field (image, name, ports, volumes, env) is
+        passed to docker as an isolated argv element. The 'command' field is
+        tokenized with shlex (safe: no shell interpretation).
+        """
         operation = payload.get("operation", "")
 
         if operation == "run":
@@ -94,84 +116,107 @@ class DockerAdapter:
             rm = payload.get("rm", False)
             command = payload.get("command", "")
 
-            cmd = "docker run"
+            cmd = ["docker", "run"]
             if detach:
-                cmd += " -d"
+                cmd.append("-d")
             if rm:
-                cmd += " --rm"
+                cmd.append("--rm")
             if name:
-                cmd += f" --name {name}"
+                cmd += ["--name", str(name)]
             for p in ports:
-                cmd += f" -p {p}"
+                cmd += ["-p", str(p)]
             for v in volumes:
-                cmd += f" -v {v}"
+                cmd += ["-v", str(v)]
             for k, v in env.items():
-                cmd += f" -e {k}={v}"
-            cmd += f" {image}"
+                cmd += ["-e", f"{k}={v}"]
+            cmd.append(str(image))
             if command:
-                cmd += f" {command}"
+                cmd += self._split_command(str(command))
             return cmd
 
         elif operation == "stop":
             container = payload.get("container", "")
             timeout = payload.get("timeout", 10)
-            return f"docker stop -t {timeout} {container}"
+            return ["docker", "stop", "-t", str(timeout), str(container)]
 
         elif operation == "rm":
             container = payload.get("container", "")
             force = payload.get("force", False)
-            cmd = f"docker rm {container}"
+            cmd = ["docker", "rm", str(container)]
             if force:
-                cmd += " -f"
+                cmd.append("-f")
             return cmd
 
         elif operation == "build":
             path = payload.get("path", ".")
             tag = payload.get("tag", "")
             dockerfile = payload.get("dockerfile", "")
-            cmd = f"docker build"
+            cmd = ["docker", "build"]
             if tag:
-                cmd += f" -t {tag}"
+                cmd += ["-t", str(tag)]
             if dockerfile:
-                cmd += f" -f {dockerfile}"
-            cmd += f" {path}"
+                cmd += ["-f", str(dockerfile)]
+            cmd.append(str(path))
             return cmd
 
         elif operation == "pull":
             image = payload.get("image", "")
-            return f"docker pull {image}"
+            return ["docker", "pull", str(image)]
 
         elif operation == "ps":
             all_containers = payload.get("all", False)
-            return "docker ps -a" if all_containers else "docker ps"
+            return ["docker", "ps", "-a"] if all_containers else ["docker", "ps"]
 
         elif operation == "logs":
             container = payload.get("container", "")
             tail = payload.get("tail", 100)
             follow = payload.get("follow", False)
-            cmd = f"docker logs --tail {tail} {container}"
+            cmd = ["docker", "logs", "--tail", str(tail), str(container)]
             if follow:
-                cmd += " -f"
+                cmd.append("-f")
             return cmd
 
         elif operation == "exec":
             container = payload.get("container", "")
             command = payload.get("command", "")
             interactive = payload.get("interactive", False)
-            cmd = f"docker exec"
+            cmd = ["docker", "exec"]
             if interactive:
-                cmd += " -it"
-            cmd += f" {container} {command}"
+                cmd.append("-it")
+            cmd.append(str(container))
+            if command:
+                cmd += self._split_command(str(command))
             return cmd
 
         elif operation == "images":
-            return "docker images"
+            return ["docker", "images"]
 
         elif operation == "inspect":
             target = payload.get("target", "")
-            return f"docker inspect {target}"
+            return ["docker", "inspect", str(target)]
 
-        return ""
+        return None
+
+    def _split_command(self, command: str) -> list[str]:
+        """Tokenize a command field with shlex (no shell interpretation)."""
+        try:
+            return shlex.split(command)
+        except ValueError:
+            raise ValueError(f"Unparseable command field: {command!r}") from None
+
+    def _is_sensitive_volume(self, volume: str) -> bool:
+        """True if a '-v' spec bind-mounts a sensitive host path.
+
+        Checks the SOURCE part of 'source:target[:opts]': the host root and
+        critical directories (/, /etc, /root, /home) must never be mounted.
+        Anonymous volumes (empty source) are allowed.
+        """
+        source = volume.split(":", 1)[0].strip() if ":" in volume else volume.strip()
+        if not source:
+            return False  # anonymous volume
+        if source in self.SENSITIVE_HOST_PATHS:
+            return True
+        return source.startswith(("/etc/", "/root/", "/home/"))
 
     def _is_blocked(self, operation: str) -> bool:
         """Check if a Docker operation is blocked."""
