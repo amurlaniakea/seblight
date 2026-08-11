@@ -302,6 +302,97 @@ class TestStructuralEncodingDetection:
 
 
 # ==========================================
+# Executor sin shell — T5 (auditoría 2026-08-11)
+# ==========================================
+
+
+class TestCommandExecutorShellSafety:
+    """T5: el CommandExecutor genérico NUNCA corre un shell (shell=False).
+
+    Los 3 bypasses de la auditoría (construcción del string con sintaxis de
+    shell: variables, IFS, printf octal) se neutralizan en el EJECUTOR aunque
+    el policy engine los clasifique SAFE. Tests PERMANENTES.
+    """
+
+    # Los 3 bypasses reportados por Claude (todos 'rm -rf /' real).
+    SHELL_BYPASS_POCS = [
+        'p1=r; p2=m; p3=" "; p4="-"; p5=r; p6=f; p7=" "; p8="/"; '
+        'cmd="$p1$p2$p3$p4$p5$p6$p7$p8"; $cmd',
+        'printf "\\162\\155\\40\\55\\162\\146\\40\\57" > /tmp/x; bash /tmp/x',
+        "r${IFS}m${IFS}-rf${IFS}/",
+    ]
+
+    def setup_method(self) -> None:
+        from seblight.core.executor import CommandExecutor
+        self.executor = CommandExecutor()
+
+    @pytest.mark.parametrize("cmd", SHELL_BYPASS_POCS)
+    def test_shell_bypass_pocs_neutralized_at_executor(self, cmd: str) -> None:
+        """El bypass se clasifica SAFE pero el ejecutor lo RECHAZA (fail-closed)."""
+        p = Proposal(
+            action="delete everything",
+            proposal_type=ProposalType.COMMAND,
+            payload={"command": cmd},
+            actor="test",
+        )
+        result = self.executor.execute(p, certificate_id="cert-1")
+        assert result.success is False
+        assert "not allowed" in result.error.lower()
+
+    def test_pipeline_rejected_loudly(self) -> None:
+        """Un pipe legítimo no se puede expresar como COMMAND string:
+        falla en voz alta (sin shell que lo interprete)."""
+        p = Proposal(
+            action="filter",
+            proposal_type=ProposalType.COMMAND,
+            payload={"command": "ls | grep foo"},
+            actor="test",
+        )
+        result = self.executor.execute(p, certificate_id="cert-1")
+        assert result.success is False
+        assert "not allowed" in result.error.lower()
+
+    def test_simple_command_still_works(self) -> None:
+        p = Proposal(
+            action="echo",
+            proposal_type=ProposalType.COMMAND,
+            payload={"command": "echo hello world"},
+            actor="test",
+        )
+        result = self.executor.execute(p, certificate_id="cert-1")
+        assert result.success is True
+        assert "hello world" in result.output
+
+    def test_quoted_semicolon_is_data_not_syntax(self) -> None:
+        """Metacaracteres entre comillas son DATO: python3 -c con ';' interno
+        sigue siendo un ejecutable + args válido."""
+        p = Proposal(
+            action="python one-liner",
+            proposal_type=ProposalType.COMMAND,
+            payload={"command": 'python3 -c "import sys; print(1)"'},
+            actor="test",
+        )
+        result = self.executor.execute(p, certificate_id="cert-1")
+        assert result.success is True
+        assert "1" in result.output
+
+    def test_bypass_rejected_end_to_end_via_broker(self) -> None:
+        """Integración: el broker procesa el bypass -> ejecución FALLIDA con
+        error claro (nunca EXECUTED)."""
+        from seblight.core.broker import BrokerConfig, SovereignExecutionBroker
+        broker = SovereignExecutionBroker(BrokerConfig(dry_run=False, secret_key="test-key"))
+        p = Proposal(
+            action="delete everything",
+            proposal_type=ProposalType.COMMAND,
+            payload={"command": "r${IFS}m${IFS}-rf${IFS}/"},
+            actor="test",
+        )
+        result = broker.process_proposal(p)
+        assert result["status"] == ExecutionStatus.FAILED.value
+        assert "not allowed" in result["execution"]["error"].lower()
+
+
+# ==========================================
 # Command Executor Tests
 # ==========================================
 
@@ -327,7 +418,7 @@ class TestCommandExecutor:
         p = Proposal(
             action="fail",
             proposal_type=ProposalType.COMMAND,
-            payload={"command": "exit 42"},
+            payload={"command": 'python3 -c "import sys; sys.exit(42)"'},
             actor="test",
         )
         result = executor.execute(p, certificate_id="test-cert")
